@@ -1,8 +1,10 @@
 rm(list = ls())
 set.seed(260225)
 
-# install.packages("survival")
+# install.packages(c("forestplot", "survival", "grid"))
+library(forestplot)
 library(survival)
+library(grid)
 
 
 
@@ -67,13 +69,13 @@ generate_one_site <- function(n, prof) {
   com2 <- rbinom(n, 1, prof$p_com2)
   
   # Scaling for analysis stability
-  age  <- (age_raw - 65)/10
+  age  <- (age_raw - 65) / 10
   
   # Treatment assignment via logistic propensity score model
   # logit P(T = 1 | Z) = Z_ps %*% beta_ps_true + site_shift
   Z_ps <- cbind(1, age, sex, com1, com2)
   ps <- sigmoid(Z_ps %*% beta_ps_true + prof$ps_shift)
-  treat <- rbinom(n,1,ps)
+  treat <- rbinom(n, 1, ps)
   
   # Survival outcome generation under Cox
   # hazard: h(t | T, Z) = cox_lambda_0 * exp(eta), h0(t) = cox_lambda_0
@@ -83,12 +85,12 @@ generate_one_site <- function(n, prof) {
   # Inverse transform sampling for exponential baseline
   # t_event = -log(u) / (cox_lambda_0 * exp(eta))
   u <- runif(n)
-  t_event <- -log(u)/(cox_lambda_0*exp(eta))
-
+  t_event <- -log(u) / (cox_lambda_0 * exp(eta))
+  
   # Censoring(random censoring, administrative censoring)
-  c_rand <- runif(n,0,c_max)
-  time  <- round(pmin(t_event,c_rand,c_max))
-  event <- as.integer(t_event <= pmin(c_rand,c_max))
+  c_rand <- runif(n, 0, c_max)
+  time  <- round(pmin(t_event, c_rand, c_max))
+  event <- as.integer(t_event <= pmin(c_rand, c_max))
   
   data.frame(site = prof$site, id = 1:n,
              age, sex, com1, com2,
@@ -125,10 +127,10 @@ sim <- generate_multisite(site_sizes)
 score_hessian_site_ps <- function(data, beta){
   X <- cbind(1, data$age, data$sex, data$com1, data$com2)
   y <- data$treat
-  p <- sigmoid(X%*%beta)
-  score <- t(X)%*%(y-p)
-  W <- as.vector(p*(1-p))
-  hess <- -t(X)%*%(X*W)
+  p <- sigmoid(X %*% beta)
+  score <- t(X) %*% (y-p)
+  W <- as.vector(p * (1 - p))
+  hess <- -t(X) %*% (X * W)
   list(score = score, hess = hess)
 }
 
@@ -168,13 +170,13 @@ beta_ps_fed <- update_ps_newton(sim$sites,rep(0,5))
 
 # Logistic regression using pooled data
 fit_ps_pooled <- glm(treat ~ age + sex + com1 + com2,
-                   data = sim$pooled, family = binomial())
+                     data = sim$pooled, family = binomial())
 beta_ps_pooled <- coef(fit_ps_pooled)
 
 
 
 # ============================================================
-# 4. IPTW
+# 4. IPTW (Weights separated for Pooled and Federated)
 # ============================================================
 
 
@@ -184,20 +186,22 @@ predict_ps <- function(df,beta){
   X <- cbind(1, df$age, df$sex, df$com1, df$com2)
   as.vector(sigmoid(X %*% beta))
 }
-sim$pooled$ps_hat <- predict_ps(sim$pooled, beta_ps_fed)
 p_treat <- mean(sim$pooled$treat)
 
+# 1) Pooled weight
+sim$pooled$ps_hat_pooled <- predict_ps(sim$pooled, beta_ps_pooled)
+sim$pooled$sw_pooled <- ifelse(sim$pooled$treat == 1,
+                               p_treat / sim$pooled$ps_hat_pooled,
+                               (1 - p_treat) / (1 - sim$pooled$ps_hat_pooled))
 
+# 2) Federated weight (Newton-Rapson)
+sim$pooled$ps_hat_fed <- predict_ps(sim$pooled, beta_ps_fed)
+sim$pooled$sw_fed <- ifelse(sim$pooled$treat == 1,
+                            p_treat / sim$pooled$ps_hat_fed,
+                            (1 - p_treat) / (1 - sim$pooled$ps_hat_fed))
 
-# Compute stabilized inverse probability of treatment weights(IPTW)
-sim$pooled$sw <- ifelse(sim$pooled$treat == 1,
-                        p_treat / sim$pooled$ps_hat,
-                        (1 - p_treat) / (1 - sim$pooled$ps_hat))
-
-
-
-# Attach weights to sites
-w_map <- sim$pooled[, c("site", "id", "sw")]
+# Attach federated weights to sites
+w_map <- sim$pooled[, c("site", "id", "sw_fed")]
 sim$sites <- lapply(sim$sites, function(df)
   merge(df, w_map, by = c("site", "id"), sort = FALSE))
 
@@ -214,7 +218,7 @@ site_cox_summary <- function(df, beta, event_times){
   time <- df$time
   event <- df$event
   x <- df$treat
-  w <- df$sw
+  w <- df$sw_fed
   exp_bx <- exp(beta * x)
   
   z0 <- w * exp_bx
@@ -299,16 +303,14 @@ fed_cox <- federated_cox_newton(sim$sites, sim$pooled)
 
 
 # ============================================================
-# 6. Pooled Cox
+# 6. Pooled Cox (Using Pooled Weights)
 # ============================================================
 
-
-
 # Fit cox regression(pooled data)
-fit_pooled<-coxph(Surv(time, event) ~ treat,
-                data = sim$pooled,
-                weights = sim$pooled$sw,
-                ties = "breslow")
+fit_pooled <- coxph(Surv(time, event) ~ treat,
+                    data = sim$pooled,
+                    weights = sim$pooled$sw_pooled,
+                    ties = "breslow")
 
 beta_pooled <- coef(fit_pooled)[["treat"]]
 se_pooled <- sqrt(vcov(fit_pooled)["treat","treat"])
@@ -319,22 +321,21 @@ se_pooled <- sqrt(vcov(fit_pooled)["treat","treat"])
 # 7. CI comparison and Visualization
 # ============================================================
 
-
-
 # Calculate CI
 out <- data.frame(
-  Method = c("Pooled", "Federated"),
+  Method = c("Pooled", "Newton-Raphson"),
   Beta = c(beta_pooled, fed_cox$beta),
   HR = exp(c(beta_pooled, fed_cox$beta)),
   CI_L = exp(c(beta_pooled - 1.96 * se_pooled,
-             fed_cox$beta - 1.96 * fed_cox$se_model)),
+               fed_cox$beta - 1.96 * fed_cox$se_model)),
   CI_U = exp(c(beta_pooled + 1.96 * se_pooled,
-             fed_cox$beta + 1.96 * fed_cox$se_model))
+               fed_cox$beta + 1.96 * fed_cox$se_model))
 )
 
+cat("\n==================== RESULTS ====================\n")
 print(out, row.names = FALSE)
 
-cat("\nAbs diff beta:",
+cat("\nAbs diff beta (Pooled vs Newton-Raphson):",
     abs(beta_pooled - fed_cox$beta), "\n")
 cat("True HR:",
     exp(beta_cox_true[1]), "\n")
@@ -342,9 +343,6 @@ cat("True HR:",
 
 
 # Visualization
-# install.packages("forestplot")
-library(forestplot)
-
 table_text <- cbind(
   c("Method", out$Method),
   c("aHR", sprintf("%.2f", out$HR)),
@@ -354,6 +352,7 @@ table_text <- cbind(
 hr_values <- c(NA, out$HR)
 ci_lower  <- c(NA, out$CI_L)
 ci_upper  <- c(NA, out$CI_U)
+
 
 forestplot(
   labeltext = table_text,
@@ -370,3 +369,9 @@ forestplot(
   xlab = "adjusted Hazard Ratio",
   graph.pos = 2
 )
+
+
+grid.text("Newton-Raphson", 
+          x = 0.5,
+          y = 0.7,
+          gp = gpar(fontsize = 16, fontface = "bold"))
