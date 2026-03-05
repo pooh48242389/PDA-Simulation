@@ -1,4 +1,4 @@
-About this project
+About this project \\
 I created this simulation with dummy data to follow the paper "Federated target trial emulation using distributed observational data for treatment effect estimation".
 
 What I did
