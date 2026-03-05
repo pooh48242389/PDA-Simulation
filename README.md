@@ -14,7 +14,7 @@ I created this simulation with dummy data to follow the paper *"Federated target
 ## Result
 Based on the simulation, the **Newton-Raphson** algorithm gave hazard estimates that are slightly closer to the pooled data results compared to the FedProx method.
 
-![Forest Plot Result](image_e4b287.png)
+![Newton_Rapson Plot Result](newton_rapson_result.png)
 
 ## Files in this repository
 * `newton_raphson.R` : Simulation and Cox regression using the Newton-Raphson algorithm.
