@@ -1,8 +1,10 @@
 rm(list = ls())
 set.seed(260225)
 
-# install.packages("survival")
+# install.packages(c("forestplot", "survival", "grid"))
+library(forestplot)
 library(survival)
+library(grid)
 
 
 
@@ -183,7 +185,7 @@ beta_ps_pooled <- coef(fit_ps_pooled)
 
 
 # ============================================================
-# 4. IPTW
+# 4. IPTW (Weights separated for Pooled and Federated)
 # ============================================================
 
 
@@ -193,20 +195,22 @@ predict_ps <- function(df, beta){
   X <- cbind(1, df$age, df$sex, df$com1, df$com2)
   as.vector(sigmoid(X %*% beta))
 }
-sim$pooled$ps_hat <- predict_ps(sim$pooled, beta_ps_fed)
 p_treat <- mean(sim$pooled$treat)
 
+# 1) Pooled weight
+sim$pooled$ps_hat_pooled <- predict_ps(sim$pooled, beta_ps_pooled)
+sim$pooled$sw_pooled <- ifelse(sim$pooled$treat == 1,
+                               p_treat / sim$pooled$ps_hat_pooled,
+                               (1 - p_treat) / (1 - sim$pooled$ps_hat_pooled))
 
+# 2) Federated weight (FedProx)
+sim$pooled$ps_hat_fed <- predict_ps(sim$pooled, beta_ps_fed)
+sim$pooled$sw_fed <- ifelse(sim$pooled$treat == 1,
+                            p_treat / sim$pooled$ps_hat_fed,
+                            (1 - p_treat) / (1 - sim$pooled$ps_hat_fed))
 
-# Compute stabilized inverse probability of treatment weights(IPTW)
-sim$pooled$sw <- ifelse(sim$pooled$treat == 1,
-                        p_treat / sim$pooled$ps_hat,
-                        (1 - p_treat) / (1 - sim$pooled$ps_hat))
-
-
-
-# Attach weights to sites
-w_map <- sim$pooled[, c("site", "id", "sw")]
+# Attach federated weights to sites
+w_map <- sim$pooled[, c("site", "id", "sw_fed")]
 sim$sites <- lapply(sim$sites, function(df)
   merge(df, w_map, by = c("site", "id"), sort = FALSE))
 
@@ -223,7 +227,7 @@ site_cox_score <- function(df, beta){
   time <- df$time
   event <- df$event
   x <- df$treat
-  w <- df$sw
+  w <- df$sw_fed
   
   et <- sort(unique(time[event == 1]))
   if (length(et) == 0) return(0)
@@ -300,12 +304,12 @@ federated_cox_fedprox <- function(sites, beta_init = 0, mu = 2, lr = 0.001, loca
 
 
 
-# Calculate score and hessian for SE calculation (Same as Newton-Rapson's site summary)
+# Calculate score and hessian for SE calculation
 site_cox_summary <- function(df, beta){
   time <- df$time
   event <- df$event
   x <- df$treat
-  w <- df$sw
+  w <- df$sw_fed
   
   et <- sort(unique(time[event == 1]))
   if (length(et) == 0) return(list(U = 0, I = 0))
@@ -368,7 +372,7 @@ se_fed_robust <- sqrt((1 / I_all)^2 * sum(Uks^2))
 
 
 # ============================================================
-# 6. Pooled Cox
+# 6. Pooled Cox (Using Pooled Weights)
 # ============================================================
 
 
@@ -376,7 +380,7 @@ se_fed_robust <- sqrt((1 / I_all)^2 * sum(Uks^2))
 # Fit cox regression(pooled data) - Model-based SE
 fit_pooled <- coxph(Surv(time, event) ~ treat,
                     data = sim$pooled,
-                    weights = sim$pooled$sw,
+                    weights = sim$pooled$sw_pooled,
                     ties = "breslow",
                     robust = FALSE)
 
@@ -386,7 +390,7 @@ se_pooled_model <- sqrt(vcov(fit_pooled)["treat","treat"])
 # Fit cox regression(pooled data) - Robust SE
 fit_pooled_rob <- coxph(Surv(time, event) ~ treat,
                         data = sim$pooled,
-                        weights = sim$pooled$sw,
+                        weights = sim$pooled$sw_pooled,
                         ties = "breslow",
                         robust = TRUE)
 se_pooled_robust <- sqrt(vcov(fit_pooled_rob)["treat","treat"])
@@ -399,7 +403,7 @@ se_pooled_robust <- sqrt(vcov(fit_pooled_rob)["treat","treat"])
 
 
 
-# Calculate CI (Comparing 4 Methods as requested)
+# Calculate CI
 out <- data.frame(
   Method = c("Pooled (Model SE)", "Federated (Model SE)",
              "Pooled (Robust SE)", "Federated (Robust SE)"),
@@ -426,9 +430,6 @@ cat("True HR:",
 
 
 # Visualization
-# install.packages("forestplot")
-library(forestplot)
-
 table_text <- cbind(
   c("Method", out$Method),
   c("aHR", sprintf("%.2f", out$HR)),
@@ -454,3 +455,8 @@ forestplot(
   xlab = "adjusted Hazard Ratio",
   graph.pos = 2
 )
+
+grid.text("FedProx", 
+          x = 0.5,
+          y = 0.9,
+          gp = gpar(fontsize = 16, fontface = "bold"))
